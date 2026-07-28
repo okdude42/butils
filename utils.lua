@@ -4554,34 +4554,61 @@ Runtime.coinDatabaseRoot = "https://keyvalue.Immanuel.co/api/KeyVal"
 Runtime.coinDatabaseNamespace = "n9ipufne"
 Runtime.coinAccounts = {}
 Runtime.totalInstances = 10
+Runtime.usedConfiguredAccounts = false
 
-local configuredAccounts = type(Global.BoogaAccounts) == "table" and Global.BoogaAccounts or nil
+local function NormalizeBoogaAccountName(value)
+    if type(value) ~= "string" then return nil end
+    local trimmed = string.match(value, "^%s*(.-)%s*$")
+    if not trimmed or trimmed == "" then return nil end
+    return string.lower(trimmed)
+end
+
+local configuredAccounts = nil
+if type(Global.BoogaAccounts) == "table" then
+    configuredAccounts = Global.BoogaAccounts
+elseif type(_G) == "table" and type(_G.BoogaAccounts) == "table" then
+    configuredAccounts = _G.BoogaAccounts
+end
+
 if configuredAccounts and #configuredAccounts > 0 then
-    Runtime.totalInstances = #configuredAccounts
-    for index, username in ipairs(configuredAccounts) do
-        if type(username) == "string" and username ~= "" then
-            Runtime.coinAccounts[username] = "Instance " .. tostring(index)
+    local seen = {}
+    local instanceIndex = 0
+    for _, username in ipairs(configuredAccounts) do
+        local normalized = NormalizeBoogaAccountName(username)
+        if normalized and not seen[normalized] then
+            seen[normalized] = true
+            instanceIndex = instanceIndex + 1
+            Runtime.coinAccounts[normalized] = "Instance " .. tostring(instanceIndex)
         end
     end
-else
-    Runtime.coinAccounts = {
-        TractionSee = "Instance 1",
-        LolTractionIsCool = "Instance 2",
-        RealTractions = "Instance 3",
-        h4wnd = "Instance 4",
-        uqerqeouuu99 = "Instance 5",
-        WontTraction = "Instance 6",
-        TractionSeeing = "Instance 7",
-        TractionXDPro = "Instance 8",
-        NotEwTraction = "Instance 9",
-        LordMason68 = "Instance 10"
+    if instanceIndex > 0 then
+        Runtime.totalInstances = instanceIndex
+        Runtime.usedConfiguredAccounts = true
+    end
+end
+
+if not Runtime.usedConfiguredAccounts then
+    local fallbackAccounts = {
+        "TractionSee",
+        "LolTractionIsCool",
+        "RealTractions",
+        "h4wnd",
+        "uqerqeouuu99",
+        "WontTraction",
+        "TractionSeeing",
+        "TractionXDPro",
+        "NotEwTraction",
+        "LordMason68"
     }
+    for index, username in ipairs(fallbackAccounts) do
+        Runtime.coinAccounts[NormalizeBoogaAccountName(username)] = "Instance " .. tostring(index)
+    end
 end
 Runtime.httpRequest = http_request or request or (syn and syn.request) or (http and http.request)
-Runtime.instanceId = Runtime.coinAccounts[Player.Name]
+Runtime.instanceId = Runtime.coinAccounts[NormalizeBoogaAccountName(Player.Name)]
 Runtime.databaseKey = Runtime.instanceId and string.gsub(Runtime.instanceId, " ", "_") or nil
-Runtime.databaseStatus = "DB waiting"
-Runtime.reportStatus = "Report waiting"
+Runtime.databaseStatus = Runtime.instanceId and "DB waiting" or "Account list mismatch"
+Runtime.reportStatus = Runtime.instanceId and "Report waiting" or "Check Roblox username"
 
 function Runtime.GetHttpStatus(response)
     if type(response) ~= "table" then return nil end
@@ -4802,6 +4829,9 @@ if Runtime.instanceId and Runtime.httpRequest then
     end)
 elseif not Runtime.instanceId then
     UI.Watcher.Workers.Text = "Workers\nAccount not mapped"
+    Runtime.databaseStatus = "Account list mismatch"
+    Runtime.reportStatus = "Check Roblox username"
+    Runtime.UpdateWebhookWatcher()
 end
 
 local function DestroyBoogaUi()
