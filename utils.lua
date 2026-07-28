@@ -4552,18 +4552,31 @@ end
 Runtime.coinWebhookUrl = tostring(Global.BoogaWebhook or "")
 Runtime.coinDatabaseRoot = "https://keyvalue.Immanuel.co/api/KeyVal"
 Runtime.coinDatabaseNamespace = "n9ipufne"
-Runtime.coinAccounts = {
-    TractionSee = "Instance 1",
-    LolTractionIsCool = "Instance 2",
-    RealTractions = "Instance 3",
-    h4wnd = "Instance 4",
-    uqerqeouuu99 = "Instance 5",
-    WontTraction = "Instance 6",
-    TractionSeeing = "Instance 7",
-    TractionXDPro = "Instance 8",
-    NotEwTraction = "Instance 9",
-    LordMason68 = "Instance 10"
-}
+Runtime.coinAccounts = {}
+Runtime.totalInstances = 10
+
+local configuredAccounts = type(Global.BoogaAccounts) == "table" and Global.BoogaAccounts or nil
+if configuredAccounts and #configuredAccounts > 0 then
+    Runtime.totalInstances = #configuredAccounts
+    for index, username in ipairs(configuredAccounts) do
+        if type(username) == "string" and username ~= "" then
+            Runtime.coinAccounts[username] = "Instance " .. tostring(index)
+        end
+    end
+else
+    Runtime.coinAccounts = {
+        TractionSee = "Instance 1",
+        LolTractionIsCool = "Instance 2",
+        RealTractions = "Instance 3",
+        h4wnd = "Instance 4",
+        uqerqeouuu99 = "Instance 5",
+        WontTraction = "Instance 6",
+        TractionSeeing = "Instance 7",
+        TractionXDPro = "Instance 8",
+        NotEwTraction = "Instance 9",
+        LordMason68 = "Instance 10"
+    }
+end
 Runtime.httpRequest = http_request or request or (syn and syn.request) or (http and http.request)
 Runtime.instanceId = Runtime.coinAccounts[Player.Name]
 Runtime.databaseKey = Runtime.instanceId and string.gsub(Runtime.instanceId, " ", "_") or nil
@@ -4700,7 +4713,7 @@ if Runtime.instanceId and Runtime.httpRequest then
 
     function Runtime.RunCoinReporterCycle()
         local fetched, activeCount, now = {}, 0, os.time()
-        for index = 1, 10 do
+        for index = 1, Runtime.totalInstances do
             local key = "Instance_" .. tostring(index)
             pcall(function()
                 local response = Runtime.httpRequest({
@@ -4725,9 +4738,9 @@ if Runtime.instanceId and Runtime.httpRequest then
             end)
         end
 
-        UI.Watcher.Workers.Text = "Workers\n" .. tostring(activeCount) .. " / 10 online"
+        UI.Watcher.Workers.Text = "Workers\n" .. tostring(activeCount) .. " / " .. tostring(Runtime.totalInstances) .. " online"
         local reporter = nil
-        for index = 1, 10 do
+        for index = 1, Runtime.totalInstances do
             local key = "Instance_" .. tostring(index)
             if fetched[key] then reporter = key break end
         end
@@ -4739,7 +4752,7 @@ if Runtime.instanceId and Runtime.httpRequest then
         end
 
         local totalCoins, totalCalculated, fields, missing = 0, 0, {}, false
-        for index = 1, 10 do
+        for index = 1, Runtime.totalInstances do
             local info = fetched["Instance_" .. tostring(index)]
             if info then
                 totalCoins = totalCoins + (tonumber(info.coins) or 0)
@@ -4767,7 +4780,7 @@ if Runtime.instanceId and Runtime.httpRequest then
             name = "Combined Totals",
             value = "Coins: " .. tostring(totalCoins)
                 .. " | Calculated: " .. tostring(totalCalculated)
-                .. " | Workers: " .. tostring(activeCount) .. " / 10"
+                .. " | Workers: " .. tostring(activeCount) .. " / " .. tostring(Runtime.totalInstances)
                 .. " | Uptime: " .. Runtime.FormatUptime(os.time() - Runtime.startedAt),
             inline = false
         })
