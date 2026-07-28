@@ -122,7 +122,11 @@ local Runtime = {
     ultraLowToken = 0,
     ultraLowConnections = {},
     ultraLowOriginals = setmetatable({}, {__mode = "k"}),
-    ultraLowQualityState = nil
+    ultraLowQualityState = nil,
+    auraPriorityUntil = 0,
+    auraLastTargetCount = 0,
+    auraLastSuccessfulSendAt = 0,
+    auraOverlapParams = nil
 }
 Runtime.pathSpeed = 19
 Runtime.pathHoverOffset = 0.1
@@ -3339,28 +3343,65 @@ function Runtime.EncodeFloat16(value)
 end
 
 function Runtime.SendGoldSwing(entityIds)
-    if #entityIds == 0 then return false end
+    if not ByteNetReliable or type(buffer) ~= "table" or type(buffer.fromstring) ~= "function" then
+        Runtime.auraLastSendOk = false
+        return false
+    end
+
     local root = Runtime.GetRoot()
-    if not root then return false end
+    if not root then
+        Runtime.auraLastSendOk = false
+        return false
+    end
+
+    local cleanIds, seen = {}, {}
+    for _, value in ipairs(entityIds) do
+        local entityId = tonumber(value)
+        if entityId then
+            entityId = math.floor(entityId)
+            if entityId >= 0 and entityId <= 4294967295 and not seen[entityId] then
+                seen[entityId] = true
+                table.insert(cleanIds, entityId)
+                if #cleanIds >= 20 then break end
+            end
+        end
+    end
+
+    if #cleanIds == 0 then
+        Runtime.auraLastSendOk = false
+        return false
+    end
+
     local sent = pcall(function()
-        local rx, ry, rz = root.CFrame:ToEulerAnglesXYZ()
+        local rootCFrame = root.CFrame
+        local rx, ry, rz = rootCFrame:ToEulerAnglesXYZ()
         local packetParts = {
             string.char(0x00, 0x42),
             string.pack(
                 "<fffHHH",
-                root.CFrame.X, root.CFrame.Y, root.CFrame.Z,
-                Runtime.EncodeFloat16(rx), Runtime.EncodeFloat16(ry), Runtime.EncodeFloat16(rz)
+                rootCFrame.X,
+                rootCFrame.Y,
+                rootCFrame.Z,
+                Runtime.EncodeFloat16(rx),
+                Runtime.EncodeFloat16(ry),
+                Runtime.EncodeFloat16(rz)
             ),
-            string.pack("<H", #entityIds)
+            string.pack("<H", #cleanIds)
         }
-        for _, entityId in ipairs(entityIds) do
-            table.insert(packetParts, string.char(0x00))
-            table.insert(packetParts, string.pack("<I4", entityId))
+
+        for _, entityId in ipairs(cleanIds) do
+            packetParts[#packetParts + 1] = string.char(0x00)
+            packetParts[#packetParts + 1] = string.pack("<I4", entityId)
         end
-        table.insert(packetParts, string.pack("<d", workspace:GetServerTimeNow()))
+
+        packetParts[#packetParts + 1] = string.pack("<d", workspace:GetServerTimeNow())
         ByteNetReliable:FireServer(buffer.fromstring(table.concat(packetParts)), nil)
     end)
+
     Runtime.auraLastSendOk = sent
+    if sent then
+        Runtime.auraLastSuccessfulSendAt = os.clock()
+    end
     return sent
 end
 
@@ -3434,36 +3475,85 @@ function Runtime.ReleaseGoldPart(part)
 end
 
 function Runtime.GetResourceAuraTargets(root, range)
-    local results, allResources = {}, {}
+    local results, seenModels, seenIds = {}, {}, {}
     local resources = workspace:FindFirstChild("Resources")
-    if resources then
-        for _, resource in ipairs(resources:GetChildren()) do
-            table.insert(allResources, resource)
+
+    local function inspectPart(part)
+        if not part or not part:IsA("BasePart") then return end
+
+        local current = part
+        local resource = nil
+        while current and current ~= workspace do
+            if current:IsA("Model") and current:GetAttribute("EntityID") then
+                local insideResources = resources and current:IsDescendantOf(resources)
+                local isWorldGold = current.Parent == workspace
+                    and string.find(Runtime.Normalized(current.Name), "gold", 1, true) ~= nil
+                if insideResources or isWorldGold then
+                    resource = current
+                    break
+                end
+            end
+            current = current.Parent
         end
+
+        if not resource or seenModels[resource] then return end
+        seenModels[resource] = true
+
+        local entityId = tonumber(resource:GetAttribute("EntityID"))
+        if not entityId or seenIds[entityId] then return end
+
+        local targetPart = resource.PrimaryPart or resource:FindFirstChildWhichIsA("BasePart")
+        if not targetPart then return end
+
+        local distance = (targetPart.Position - root.Position).Magnitude
+        if distance > range then return end
+
+        seenIds[entityId] = true
+        table.insert(results, {
+            entityId = entityId,
+            distance = distance,
+            isGold = string.find(Runtime.Normalized(resource.Name), "gold", 1, true) ~= nil
+        })
     end
-    for _, resource in ipairs(workspace:GetChildren()) do
-        if resource:IsA("Model") and resource.Name == "Gold Node" then
-            table.insert(allResources, resource)
+
+    if not Runtime.auraOverlapParams then
+        local params = OverlapParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        Runtime.auraOverlapParams = params
+    end
+
+    Runtime.auraOverlapParams.FilterDescendantsInstances = Player.Character and {Player.Character} or {}
+
+    local queried, nearbyParts = pcall(function()
+        return workspace:GetPartBoundsInRadius(root.Position, range, Runtime.auraOverlapParams)
+    end)
+
+    if queried and nearbyParts then
+        for _, part in ipairs(nearbyParts) do
+            inspectPart(part)
         end
-    end
-    for _, resource in ipairs(allResources) do
-        if resource:IsA("Model") and resource:GetAttribute("EntityID") then
-            local part = resource.PrimaryPart or resource:FindFirstChildWhichIsA("BasePart")
-            if not part then continue end
-            local distance = (part.Position - root.Position).Magnitude
-            if distance <= range then
-                table.insert(results, {
-                    entityId = resource:GetAttribute("EntityID"),
-                    distance = distance,
-                    isGold = string.find(Runtime.Normalized(resource.Name), "gold", 1, true) ~= nil
-                })
+    else
+        if resources then
+            for _, resource in ipairs(resources:GetChildren()) do
+                if resource:IsA("Model") then
+                    inspectPart(resource.PrimaryPart or resource:FindFirstChildWhichIsA("BasePart"))
+                end
+            end
+        end
+
+        for _, resource in ipairs(workspace:GetChildren()) do
+            if resource:IsA("Model")
+                and string.find(Runtime.Normalized(resource.Name), "gold", 1, true) then
+                inspectPart(resource.PrimaryPart or resource:FindFirstChildWhichIsA("BasePart"))
             end
         end
     end
+
     table.sort(results, function(a, b)
         if a.isGold ~= b.isGold then return a.isGold end
         return a.distance < b.distance
     end)
+
     return results
 end
 
@@ -3786,54 +3876,20 @@ end)
 task.spawn(function()
     local sendCredit = 0
     local pressCursor = 1
-    local lowEndSendsPerSecond = 1680
-    local lowEndMaximumBurst = 192
+    local normalSendsPerSecond = 360
+    local lowEndSendsPerSecond = 240
+    local maximumBurst = 24
 
     while Runtime.running do
-        if not State.lowEnd then
-            sendCredit = 0
-            task.wait(0.03)
-
-            if not State.coinPress or not Packets or not Packets.InteractStructure or not ItemIDS then
-                continue
-            end
-
-            local root = Runtime.GetRoot()
-            local deployables = workspace:FindFirstChild("Deployables")
-            local goldId = ItemIDS.Gold or ItemIDS["Gold"]
-            if not root or not deployables or not goldId then continue end
-
-            local presses = {}
-            for _, item in ipairs(deployables:GetChildren()) do
-                if item.Name == "Coin Press" then
-                    local distance = (root.Position - item:GetPivot().Position).Magnitude
-                    local entityId = item:GetAttribute("EntityID")
-                    if entityId and distance <= 24 then
-                        table.insert(presses, {entityId = entityId, distance = distance})
-                    end
-                end
-            end
-
-            table.sort(presses, function(a, b) return a.distance < b.distance end)
-            for index, press in ipairs(presses) do
-                if index > 3 then break end
-                for _ = 1, 28 do
-                    pcall(function()
-                        Packets.InteractStructure.send({
-                            entityID = press.entityId,
-                            itemID = goldId
-                        })
-                    end)
-                end
-            end
-
-            continue
-        end
-
         local deltaTime = Services.RunService.Heartbeat:Wait()
 
         if not State.coinPress or not Packets or not Packets.InteractStructure or not ItemIDS then
             sendCredit = 0
+            continue
+        end
+
+        if os.clock() < Runtime.auraPriorityUntil then
+            sendCredit = math.min(sendCredit, 2)
             continue
         end
 
@@ -3851,7 +3907,10 @@ task.spawn(function()
                 local distance = (root.Position - item:GetPivot().Position).Magnitude
                 local entityId = item:GetAttribute("EntityID")
                 if entityId and distance <= 24 then
-                    table.insert(presses, {entityId = entityId, distance = distance})
+                    table.insert(presses, {
+                        entityId = entityId,
+                        distance = distance
+                    })
                 end
             end
         end
@@ -3861,21 +3920,30 @@ task.spawn(function()
             continue
         end
 
-        table.sort(presses, function(a, b) return a.distance < b.distance end)
+        table.sort(presses, function(a, b)
+            return a.distance < b.distance
+        end)
+
         while #presses > 3 do
             table.remove(presses)
         end
 
+        local sendsPerSecond = State.lowEnd and lowEndSendsPerSecond or normalSendsPerSecond
         sendCredit = math.min(
-            sendCredit + math.min(tonumber(deltaTime) or 0, 0.1) * lowEndSendsPerSecond,
-            lowEndMaximumBurst
+            sendCredit + math.min(tonumber(deltaTime) or 0, 0.1) * sendsPerSecond,
+            maximumBurst
         )
 
-        local sendCount = math.min(math.floor(sendCredit), lowEndMaximumBurst)
+        local sendCount = math.min(math.floor(sendCredit), maximumBurst)
         if sendCount <= 0 then continue end
         sendCredit = sendCredit - sendCount
 
         for _ = 1, sendCount do
+            if os.clock() < Runtime.auraPriorityUntil then
+                sendCredit = 0
+                break
+            end
+
             if pressCursor > #presses then pressCursor = 1 end
             local press = presses[pressCursor]
             pressCursor = pressCursor + 1
@@ -4385,19 +4453,50 @@ task.spawn(function()
 end)
 
 task.spawn(function()
+    local accumulator = 0
+
     while Runtime.running do
-        task.wait(0.1)
-        if not State.goldHitAura then continue end
+        local deltaTime = Services.RunService.Heartbeat:Wait()
+
+        if not State.goldHitAura then
+            accumulator = 0
+            Runtime.auraLastTargetCount = 0
+            continue
+        end
+
+        accumulator = accumulator + math.min(tonumber(deltaTime) or 0, 0.2)
+        local interval = State.lowEnd and 0.1 or 0.08
+        if accumulator < interval then continue end
+        accumulator = accumulator % interval
+
         local root = Runtime.GetRoot()
-        if not root then continue end
-        local nodes = Runtime.GetResourceAuraTargets(root, 20)
+        if not root then
+            Runtime.auraLastTargetCount = 0
+            continue
+        end
+
+        local scanned, nodes = pcall(Runtime.GetResourceAuraTargets, root, 20)
+        if not scanned or type(nodes) ~= "table" then
+            Runtime.auraLastTargetCount = 0
+            continue
+        end
+
         local entityIds = {}
-        for index = 1, math.min(#nodes, 20) do table.insert(entityIds, nodes[index].entityId) end
+        for index = 1, math.min(#nodes, 20) do
+            entityIds[#entityIds + 1] = nodes[index].entityId
+        end
+
+        Runtime.auraLastTargetCount = #entityIds
+
         local auraToggle = UI.Toggles.goldHitAura
         if auraToggle then
             auraToggle.button.Text = "Gold Hit Aura: ON [" .. tostring(#entityIds) .. "]"
         end
-        Runtime.SendGoldSwing(entityIds)
+
+        if #entityIds > 0 then
+            Runtime.auraPriorityUntil = os.clock() + 0.22
+            Runtime.SendGoldSwing(entityIds)
+        end
     end
 end)
 
