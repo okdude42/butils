@@ -123,10 +123,11 @@ local Runtime = {
     ultraLowConnections = {},
     ultraLowOriginals = setmetatable({}, {__mode = "k"}),
     ultraLowQualityState = nil,
-    auraPriorityUntil = 0,
     auraLastTargetCount = 0,
     auraLastSuccessfulSendAt = 0,
-    auraOverlapParams = nil
+    auraOverlapParams = nil,
+    utilityTrafficUntil = 0,
+    coinPressSending = false
 }
 Runtime.pathSpeed = 19
 Runtime.pathHoverOffset = 0.1
@@ -169,6 +170,45 @@ pcall(function()
 end)
 
 local ByteNetReliable = Services.ReplicatedStorage:WaitForChild("ByteNetReliable")
+
+function Runtime.MarkUtilityTraffic(duration)
+    local untilTime = os.clock() + math.max(0, tonumber(duration) or 0.025)
+    if untilTime > Runtime.utilityTrafficUntil then
+        Runtime.utilityTrafficUntil = untilTime
+    end
+end
+
+function Runtime.InstallPacketTrafficGuards()
+    if not Packets then return end
+
+    for _, packetName in ipairs({
+        "Pickup",
+        "UseBagItem",
+        "DropBagItem",
+        "ForceInteract",
+        "InteractStructure"
+    }) do
+        local packet = Packets[packetName]
+        if type(packet) == "table" and type(packet.send) == "function" then
+            local original = rawget(packet, "__BoogaUtilityOriginalSend")
+            if type(original) ~= "function" then
+                original = packet.send
+                rawset(packet, "__BoogaUtilityOriginalSend", original)
+            end
+
+            packet.send = function(...)
+                if Runtime.running
+                    and not (packetName == "InteractStructure" and Runtime.coinPressSending) then
+                    local duration = packetName == "Pickup" and 0.025 or 0.035
+                    Runtime.MarkUtilityTraffic(duration)
+                end
+                return original(...)
+            end
+        end
+    end
+end
+
+Runtime.InstallPacketTrafficGuards()
 
 local FruitIDs = {
     Bloodfruit = 94,
@@ -3372,6 +3412,8 @@ function Runtime.SendGoldSwing(entityIds)
         return false
     end
 
+    Runtime.MarkUtilityTraffic(0.025)
+
     local sent = pcall(function()
         local rootCFrame = root.CFrame
         local rx, ry, rz = rootCFrame:ToEulerAnglesXYZ()
@@ -3417,6 +3459,7 @@ function Runtime.SendAutoOpenChest(chest)
     if not ByteNetReliable or type(buffer) ~= "table" or type(buffer.fromstring) ~= "function" then return false end
     local entityId = tonumber(Runtime.GetEntityId(chest))
     if not entityId then return false end
+    Runtime.MarkUtilityTraffic(0.06)
     local opened = pcall(function()
         ByteNetReliable:FireServer(buffer.fromstring(string.pack("<BBI4", 0x00, 0x6C, entityId)), nil)
     end)
@@ -3874,22 +3917,19 @@ task.spawn(function()
 end)
 
 task.spawn(function()
-    local sendCredit = 0
     local pressCursor = 1
-    local normalSendsPerSecond = 360
-    local lowEndSendsPerSecond = 240
-    local maximumBurst = 24
+    local sendCredit = 0
+    local cachedPresses = {}
+    local nextPressRefreshAt = 0
+    local maximumBurst = 3
 
     while Runtime.running do
         local deltaTime = Services.RunService.Heartbeat:Wait()
 
         if not State.coinPress or not Packets or not Packets.InteractStructure or not ItemIDS then
             sendCredit = 0
-            continue
-        end
-
-        if os.clock() < Runtime.auraPriorityUntil then
-            sendCredit = math.min(sendCredit, 2)
+            cachedPresses = {}
+            nextPressRefreshAt = 0
             continue
         end
 
@@ -3898,62 +3938,96 @@ task.spawn(function()
         local goldId = ItemIDS.Gold or ItemIDS["Gold"]
         if not root or not deployables or not goldId then
             sendCredit = 0
+            cachedPresses = {}
+            nextPressRefreshAt = 0
             continue
         end
 
-        local presses = {}
-        for _, item in ipairs(deployables:GetChildren()) do
-            if item.Name == "Coin Press" then
-                local distance = (root.Position - item:GetPivot().Position).Magnitude
-                local entityId = item:GetAttribute("EntityID")
-                if entityId and distance <= 24 then
-                    table.insert(presses, {
-                        entityId = entityId,
-                        distance = distance
-                    })
+        local now = os.clock()
+        if now >= nextPressRefreshAt then
+            local refreshed = {}
+            for _, item in ipairs(deployables:GetChildren()) do
+                if item.Name == "Coin Press" and item.Parent == deployables then
+                    local entityId = item:GetAttribute("EntityID")
+                    if entityId then
+                        local distance = (root.Position - item:GetPivot().Position).Magnitude
+                        if distance <= 20 then
+                            table.insert(refreshed, {
+                                object = item,
+                                entityId = entityId,
+                                distance = distance
+                            })
+                        end
+                    end
                 end
+            end
+
+            table.sort(refreshed, function(a, b)
+                return a.distance < b.distance
+            end)
+
+            while #refreshed > 3 do
+                table.remove(refreshed)
+            end
+
+            cachedPresses = refreshed
+            nextPressRefreshAt = now + 0.2
+            if pressCursor > #cachedPresses then
+                pressCursor = 1
             end
         end
 
-        if #presses == 0 then
+        local validPresses = {}
+        for _, press in ipairs(cachedPresses) do
+            local item = press.object
+            if item and item.Parent == deployables and item:GetAttribute("EntityID") == press.entityId then
+                local distance = (root.Position - item:GetPivot().Position).Magnitude
+                if distance <= 20 then
+                    press.distance = distance
+                    table.insert(validPresses, press)
+                end
+            end
+        end
+        cachedPresses = validPresses
+
+        if #cachedPresses == 0 then
             sendCredit = 0
             continue
         end
 
-        table.sort(presses, function(a, b)
-            return a.distance < b.distance
-        end)
-
-        while #presses > 3 do
-            table.remove(presses)
+        if os.clock() < Runtime.utilityTrafficUntil then
+            sendCredit = math.min(sendCredit, 1)
+            continue
         end
 
-        local sendsPerSecond = State.lowEnd and lowEndSendsPerSecond or normalSendsPerSecond
+        local sendsPerSecond = State.lowEnd and 32 or 36
         sendCredit = math.min(
             sendCredit + math.min(tonumber(deltaTime) or 0, 0.1) * sendsPerSecond,
             maximumBurst
         )
 
         local sendCount = math.min(math.floor(sendCredit), maximumBurst)
-        if sendCount <= 0 then continue end
+        if sendCount <= 0 then
+            continue
+        end
         sendCredit = sendCredit - sendCount
 
         for _ = 1, sendCount do
-            if os.clock() < Runtime.auraPriorityUntil then
-                sendCredit = 0
-                break
+            if pressCursor > #cachedPresses then
+                pressCursor = 1
             end
 
-            if pressCursor > #presses then pressCursor = 1 end
-            local press = presses[pressCursor]
+            local press = cachedPresses[pressCursor]
             pressCursor = pressCursor + 1
 
+            Runtime.coinPressSending = true
             pcall(function()
                 Packets.InteractStructure.send({
                     entityID = press.entityId,
                     itemID = goldId
                 })
             end)
+            Runtime.coinPressSending = false
         end
     end
 end)
@@ -4456,7 +4530,7 @@ task.spawn(function()
     local accumulator = 0
 
     while Runtime.running do
-        local deltaTime = Services.RunService.Heartbeat:Wait()
+        local _, deltaTime = Services.RunService.Stepped:Wait()
 
         if not State.goldHitAura then
             accumulator = 0
@@ -4494,7 +4568,6 @@ task.spawn(function()
         end
 
         if #entityIds > 0 then
-            Runtime.auraPriorityUntil = os.clock() + 0.22
             Runtime.SendGoldSwing(entityIds)
         end
     end
