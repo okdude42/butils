@@ -126,8 +126,10 @@ local Runtime = {
     auraLastTargetCount = 0,
     auraLastSuccessfulSendAt = 0,
     auraOverlapParams = nil,
-    utilityTrafficUntil = 0,
-    coinPressSending = false
+    coinPressPaused = false,
+    coinPressGoldCount = 0,
+    coinPressLastSendAt = 0,
+    harvestLastSuccessAt = 0
 }
 Runtime.pathSpeed = 19
 Runtime.pathHoverOffset = 0.1
@@ -170,45 +172,6 @@ pcall(function()
 end)
 
 local ByteNetReliable = Services.ReplicatedStorage:WaitForChild("ByteNetReliable")
-
-function Runtime.MarkUtilityTraffic(duration)
-    local untilTime = os.clock() + math.max(0, tonumber(duration) or 0.025)
-    if untilTime > Runtime.utilityTrafficUntil then
-        Runtime.utilityTrafficUntil = untilTime
-    end
-end
-
-function Runtime.InstallPacketTrafficGuards()
-    if not Packets then return end
-
-    for _, packetName in ipairs({
-        "Pickup",
-        "UseBagItem",
-        "DropBagItem",
-        "ForceInteract",
-        "InteractStructure"
-    }) do
-        local packet = Packets[packetName]
-        if type(packet) == "table" and type(packet.send) == "function" then
-            local original = rawget(packet, "__BoogaUtilityOriginalSend")
-            if type(original) ~= "function" then
-                original = packet.send
-                rawset(packet, "__BoogaUtilityOriginalSend", original)
-            end
-
-            packet.send = function(...)
-                if Runtime.running
-                    and not (packetName == "InteractStructure" and Runtime.coinPressSending) then
-                    local duration = packetName == "Pickup" and 0.025 or 0.035
-                    Runtime.MarkUtilityTraffic(duration)
-                end
-                return original(...)
-            end
-        end
-    end
-end
-
-Runtime.InstallPacketTrafficGuards()
 
 local FruitIDs = {
     Bloodfruit = 94,
@@ -2915,9 +2878,13 @@ function Runtime.OnToggle(key, enabled)
         local root = Runtime.GetRoot()
         local humanoid = root and root.Parent and root.Parent:FindFirstChildOfClass("Humanoid")
         if humanoid then humanoid.WalkSpeed = 16 end
-    elseif key == "pauseNearPress" and not enabled and Runtime.freezeConnection then
-        Runtime.freezeConnection:Disconnect()
-        Runtime.freezeConnection = nil
+    elseif key == "pauseNearPress" and not enabled then
+        if Runtime.ReleaseCoinPressPause then
+            Runtime.ReleaseCoinPressPause()
+        elseif Runtime.freezeConnection then
+            Runtime.freezeConnection:Disconnect()
+            Runtime.freezeConnection = nil
+        end
     end
 end
 
@@ -3205,6 +3172,130 @@ function Runtime.GetItemQuantity(guiItem)
     return 1
 end
 
+function Runtime.GetInventoryQuantity(itemName)
+    local inventory = Runtime.GetInventory()
+    if not inventory then return nil, false end
+
+    local total = 0
+    for _, child in ipairs(inventory:GetChildren()) do
+        if child:IsA("ImageLabel") and Runtime.ItemNameMatches(itemName, child.Name) then
+            local quantity = nil
+
+            for _, key in ipairs({"Amount", "Quantity", "Count", "Stack"}) do
+                local attribute = child:GetAttribute(key)
+                if tonumber(attribute) then
+                    quantity = tonumber(attribute)
+                    break
+                end
+
+                local valueObject = child:FindFirstChild(key)
+                if valueObject and valueObject:IsA("ValueBase") and tonumber(valueObject.Value) then
+                    quantity = tonumber(valueObject.Value)
+                    break
+                end
+            end
+
+            if not quantity then
+                for _, descendant in ipairs(child:GetDescendants()) do
+                    if descendant:IsA("TextLabel") then
+                        local number = tonumber(tostring(descendant.Text):match("%d+"))
+                        if number then
+                            quantity = number
+                            break
+                        end
+                    end
+                end
+            end
+
+            total = total + math.max(0, tonumber(quantity) or 1)
+        end
+    end
+
+    return total, true
+end
+
+function Runtime.GetNearestCoinPress(root, range)
+    local deployables = workspace:FindFirstChild("Deployables")
+    if not root or not deployables then return nil end
+
+    local closest, closestDistance = nil, tonumber(range) or 20
+    for _, item in ipairs(deployables:GetChildren()) do
+        if item:IsA("Model") and item.Name == "Coin Press" then
+            local entityId = tonumber(Runtime.GetEntityId(item))
+            if entityId then
+                local distance = (root.Position - item:GetPivot().Position).Magnitude
+                if distance <= closestDistance then
+                    closest = {
+                        object = item,
+                        entityId = entityId,
+                        distance = distance
+                    }
+                    closestDistance = distance
+                end
+            end
+        end
+    end
+
+    return closest
+end
+
+function Runtime.ReleaseCoinPressPause()
+    local wasPaused = Runtime.coinPressPaused or Runtime.freezeConnection ~= nil
+
+    if Runtime.freezeConnection then
+        pcall(function()
+            Runtime.freezeConnection:Disconnect()
+        end)
+        Runtime.freezeConnection = nil
+    end
+
+    Runtime.coinPressPaused = false
+
+    if wasPaused and Runtime.running and State.startPath then
+        task.defer(function()
+            task.wait(0.08)
+            if Runtime.running and State.startPath and not Runtime.freezeConnection then
+                pcall(Runtime.RestartPath)
+            end
+        end)
+    end
+end
+
+function Runtime.BeginCoinPressPause(root)
+    if Runtime.coinPressPaused and Runtime.freezeConnection then return end
+    if not root or not root.Parent then return end
+
+    Runtime.CancelMotion()
+    Runtime.StopPathMovement()
+    Runtime.coinPressPaused = true
+
+    local lockedCFrame = root.CFrame
+    Runtime.freezeConnection = Services.RunService.Heartbeat:Connect(function()
+        local currentRoot = Runtime.GetRoot()
+        if not Runtime.running
+            or not State.coinPress
+            or not State.pauseNearPress
+            or not Runtime.coinPressPaused
+            or currentRoot ~= root then
+            Runtime.ReleaseCoinPressPause()
+            return
+        end
+
+        currentRoot.AssemblyLinearVelocity = Vector3.zero
+        currentRoot.AssemblyAngularVelocity = Vector3.zero
+
+        if (currentRoot.Position - lockedCFrame.Position).Magnitude > 0.75 then
+            currentRoot.CFrame = lockedCFrame
+        end
+
+        local humanoid = currentRoot.Parent and currentRoot.Parent:FindFirstChildOfClass("Humanoid")
+        if humanoid then
+            humanoid.Jump = false
+            humanoid:Move(Vector3.zero, false)
+        end
+    end)
+end
+
 function Runtime.Normalized(name)
     return string.lower(tostring(name)):gsub("[%s_%-]", "")
 end
@@ -3308,35 +3399,62 @@ function Runtime.GetPlantBoxes(root, range)
 end
 
 function Runtime.GetBushes(root, range, fruitFilter)
-    local results, seen = {}, {}
+    local results, seenModels, seenIds = {}, {}, {}
+    local selectedFruit = type(fruitFilter) == "string" and fruitFilter
+        or (fruitFilter == true and "Sunfruit" or nil)
+    local selectedNormalized = selectedFruit and Runtime.Normalized(selectedFruit) or nil
+
     local function inspect(model)
-        if seen[model] or not model:IsA("Model") then return end
-        seen[model] = true
+        if not model or seenModels[model] or not model:IsA("Model") then return end
+        seenModels[model] = true
+
         local normalizedName = Runtime.Normalized(model.Name)
-        local matched = false
-        local selectedFruit = type(fruitFilter) == "string" and fruitFilter
-            or (fruitFilter == true and "Sunfruit" or nil)
-        for fruitName in pairs(FruitIDs) do
-            if (not selectedFruit or fruitName == selectedFruit)
-                and string.find(normalizedName, Runtime.Normalized(fruitName), 1, true) then
-                matched = true
-                break
+        local matched = selectedNormalized
+            and string.find(normalizedName, selectedNormalized, 1, true) ~= nil
+            or false
+
+        if not selectedNormalized then
+            for fruitName in pairs(FruitIDs) do
+                if string.find(normalizedName, Runtime.Normalized(fruitName), 1, true) then
+                    matched = true
+                    break
+                end
             end
         end
+
         if not matched then return end
+
         local part = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
-        local entityId = model:GetAttribute("EntityID")
-        if part and entityId then
-            local distance = (part.Position - root.Position).Magnitude
-            if distance <= range then
-                table.insert(results, {model = model, part = part, entityId = entityId, distance = distance})
-            end
+        local entityId = tonumber(Runtime.GetEntityId(model))
+        if not part or not entityId or seenIds[entityId] then return end
+
+        local distance = (part.Position - root.Position).Magnitude
+        if distance > range then return end
+
+        seenIds[entityId] = true
+        table.insert(results, {
+            model = model,
+            part = part,
+            entityId = entityId,
+            distance = distance
+        })
+    end
+
+    for _, model in ipairs(workspace:GetChildren()) do
+        inspect(model)
+    end
+
+    local resources = workspace:FindFirstChild("Resources")
+    if resources then
+        for _, model in ipairs(resources:GetChildren()) do
+            inspect(model)
         end
     end
-    for _, model in ipairs(workspace:GetChildren()) do inspect(model) end
-    local resources = workspace:FindFirstChild("Resources")
-    if resources then for _, model in ipairs(resources:GetChildren()) do inspect(model) end end
-    table.sort(results, function(a, b) return a.distance < b.distance end)
+
+    table.sort(results, function(a, b)
+        return a.distance < b.distance
+    end)
+
     return results
 end
 
@@ -3412,8 +3530,6 @@ function Runtime.SendGoldSwing(entityIds)
         return false
     end
 
-    Runtime.MarkUtilityTraffic(0.025)
-
     local sent = pcall(function()
         local rootCFrame = root.CFrame
         local rx, ry, rz = rootCFrame:ToEulerAnglesXYZ()
@@ -3459,7 +3575,6 @@ function Runtime.SendAutoOpenChest(chest)
     if not ByteNetReliable or type(buffer) ~= "table" or type(buffer.fromstring) ~= "function" then return false end
     local entityId = tonumber(Runtime.GetEntityId(chest))
     if not entityId then return false end
-    Runtime.MarkUtilityTraffic(0.06)
     local opened = pcall(function()
         ByteNetReliable:FireServer(buffer.fromstring(string.pack("<BBI4", 0x00, 0x6C, entityId)), nil)
     end)
@@ -3521,34 +3636,17 @@ function Runtime.GetResourceAuraTargets(root, range)
     local results, seenModels, seenIds = {}, {}, {}
     local resources = workspace:FindFirstChild("Resources")
 
-    local function inspectPart(part)
-        if not part or not part:IsA("BasePart") then return end
-
-        local current = part
-        local resource = nil
-        while current and current ~= workspace do
-            if current:IsA("Model") and current:GetAttribute("EntityID") then
-                local insideResources = resources and current:IsDescendantOf(resources)
-                local isWorldGold = current.Parent == workspace
-                    and string.find(Runtime.Normalized(current.Name), "gold", 1, true) ~= nil
-                if insideResources or isWorldGold then
-                    resource = current
-                    break
-                end
-            end
-            current = current.Parent
-        end
-
-        if not resource or seenModels[resource] then return end
+    local function inspect(resource)
+        if not resource or seenModels[resource] or not resource:IsA("Model") then return end
         seenModels[resource] = true
 
-        local entityId = tonumber(resource:GetAttribute("EntityID"))
+        local entityId = tonumber(Runtime.GetEntityId(resource))
         if not entityId or seenIds[entityId] then return end
 
-        local targetPart = resource.PrimaryPart or resource:FindFirstChildWhichIsA("BasePart")
-        if not targetPart then return end
+        local part = resource.PrimaryPart or resource:FindFirstChildWhichIsA("BasePart")
+        if not part then return end
 
-        local distance = (targetPart.Position - root.Position).Magnitude
+        local distance = (part.Position - root.Position).Magnitude
         if distance > range then return end
 
         seenIds[entityId] = true
@@ -3559,36 +3657,15 @@ function Runtime.GetResourceAuraTargets(root, range)
         })
     end
 
-    if not Runtime.auraOverlapParams then
-        local params = OverlapParams.new()
-        params.FilterType = Enum.RaycastFilterType.Exclude
-        Runtime.auraOverlapParams = params
+    if resources then
+        for _, resource in ipairs(resources:GetChildren()) do
+            inspect(resource)
+        end
     end
 
-    Runtime.auraOverlapParams.FilterDescendantsInstances = Player.Character and {Player.Character} or {}
-
-    local queried, nearbyParts = pcall(function()
-        return workspace:GetPartBoundsInRadius(root.Position, range, Runtime.auraOverlapParams)
-    end)
-
-    if queried and nearbyParts then
-        for _, part in ipairs(nearbyParts) do
-            inspectPart(part)
-        end
-    else
-        if resources then
-            for _, resource in ipairs(resources:GetChildren()) do
-                if resource:IsA("Model") then
-                    inspectPart(resource.PrimaryPart or resource:FindFirstChildWhichIsA("BasePart"))
-                end
-            end
-        end
-
-        for _, resource in ipairs(workspace:GetChildren()) do
-            if resource:IsA("Model")
-                and string.find(Runtime.Normalized(resource.Name), "gold", 1, true) then
-                inspectPart(resource.PrimaryPart or resource:FindFirstChildWhichIsA("BasePart"))
-            end
+    for _, resource in ipairs(workspace:GetChildren()) do
+        if resource:IsA("Model") and resource.Name == "Gold Node" then
+            inspect(resource)
         end
     end
 
@@ -3764,13 +3841,28 @@ end)
 
 task.spawn(function()
     while Runtime.running do
-        task.wait(0.05)
-        if not State.autoFarm or not Packets or not Packets.Pickup then continue end
-        local root = Runtime.GetRoot()
-        if not root then continue end
-        local bushes = Runtime.GetBushes(root, 45, true)
-        for index = 1, #bushes do
-            pcall(function() Packets.Pickup.send(bushes[index].entityId) end)
+        task.wait(0.1)
+
+        local completed = pcall(function()
+            if not State.autoFarm or not Packets or not Packets.Pickup or not Packets.Pickup.send then
+                return
+            end
+
+            local root = Runtime.GetRoot()
+            if not root then return end
+
+            for _, bush in ipairs(Runtime.GetBushes(root, 45, "Sunfruit")) do
+                local sent = pcall(function()
+                    Packets.Pickup.send(bush.entityId)
+                end)
+                if sent then
+                    Runtime.harvestLastSuccessAt = os.clock()
+                end
+            end
+        end)
+
+        if not completed then
+            task.wait(0.2)
         end
     end
 end)
@@ -3843,12 +3935,28 @@ end)
 
 task.spawn(function()
     while Runtime.running do
-        task.wait(0.05)
-        if not State.bfMasterFarm or not State.bfAutoHarvest or not Packets or not Packets.Pickup then continue end
-        local root = Runtime.GetRoot()
-        if not root then continue end
-        for _, bush in ipairs(Runtime.GetBushes(root, 30, "Bloodfruit")) do
-            pcall(function() Packets.Pickup.send(bush.entityId) end)
+        task.wait(0.1)
+
+        local completed = pcall(function()
+            if not State.bfAutoHarvest or not Packets or not Packets.Pickup or not Packets.Pickup.send then
+                return
+            end
+
+            local root = Runtime.GetRoot()
+            if not root then return end
+
+            for _, bush in ipairs(Runtime.GetBushes(root, 30, "Bloodfruit")) do
+                local sent = pcall(function()
+                    Packets.Pickup.send(bush.entityId)
+                end)
+                if sent then
+                    Runtime.harvestLastSuccessAt = os.clock()
+                end
+            end
+        end)
+
+        if not completed then
+            task.wait(0.2)
         end
     end
 end)
@@ -3917,172 +4025,77 @@ task.spawn(function()
 end)
 
 task.spawn(function()
-    local pressCursor = 1
-    local sendCredit = 0
-    local cachedPresses = {}
-    local nextPressRefreshAt = 0
-    local maximumBurst = 3
+    local nextSendAt = 0
+    local emptyChecks = 0
 
     while Runtime.running do
-        local deltaTime = Services.RunService.Heartbeat:Wait()
+        task.wait(0.02)
 
-        if not State.coinPress or not Packets or not Packets.InteractStructure or not ItemIDS then
-            sendCredit = 0
-            cachedPresses = {}
-            nextPressRefreshAt = 0
-            continue
-        end
+        local completed = pcall(function()
+            if not State.coinPress
+                or not Packets
+                or not Packets.InteractStructure
+                or not Packets.InteractStructure.send
+                or not ItemIDS then
+                emptyChecks = 0
+                Runtime.coinPressGoldCount = 0
+                Runtime.ReleaseCoinPressPause()
+                return
+            end
 
-        local root = Runtime.GetRoot()
-        local deployables = workspace:FindFirstChild("Deployables")
-        local goldId = ItemIDS.Gold or ItemIDS["Gold"]
-        if not root or not deployables or not goldId then
-            sendCredit = 0
-            cachedPresses = {}
-            nextPressRefreshAt = 0
-            continue
-        end
+            local root = Runtime.GetRoot()
+            if not root then
+                Runtime.ReleaseCoinPressPause()
+                return
+            end
 
-        local now = os.clock()
-        if now >= nextPressRefreshAt then
-            local refreshed = {}
-            for _, item in ipairs(deployables:GetChildren()) do
-                if item.Name == "Coin Press" and item.Parent == deployables then
-                    local entityId = item:GetAttribute("EntityID")
-                    if entityId then
-                        local distance = (root.Position - item:GetPivot().Position).Magnitude
-                        if distance <= 20 then
-                            table.insert(refreshed, {
-                                object = item,
-                                entityId = entityId,
-                                distance = distance
-                            })
-                        end
-                    end
+            local goldId = ItemIDS.Gold or ItemIDS["Gold"]
+            if not goldId then
+                Runtime.ReleaseCoinPressPause()
+                return
+            end
+
+            local goldCount, inventoryReady = Runtime.GetInventoryQuantity("Gold Bar")
+            if not inventoryReady then return end
+
+            Runtime.coinPressGoldCount = goldCount
+
+            if goldCount <= 0 then
+                emptyChecks = emptyChecks + 1
+                if emptyChecks >= 3 then
+                    Runtime.ReleaseCoinPressPause()
                 end
+                return
             end
 
-            table.sort(refreshed, function(a, b)
-                return a.distance < b.distance
-            end)
+            emptyChecks = 0
 
-            while #refreshed > 3 do
-                table.remove(refreshed)
+            local press = Runtime.GetNearestCoinPress(root, 20)
+            if not press then
+                Runtime.ReleaseCoinPressPause()
+                return
             end
 
-            cachedPresses = refreshed
-            nextPressRefreshAt = now + 0.2
-            if pressCursor > #cachedPresses then
-                pressCursor = 1
-            end
-        end
-
-        local validPresses = {}
-        for _, press in ipairs(cachedPresses) do
-            local item = press.object
-            if item and item.Parent == deployables and item:GetAttribute("EntityID") == press.entityId then
-                local distance = (root.Position - item:GetPivot().Position).Magnitude
-                if distance <= 20 then
-                    press.distance = distance
-                    table.insert(validPresses, press)
-                end
-            end
-        end
-        cachedPresses = validPresses
-
-        if #cachedPresses == 0 then
-            sendCredit = 0
-            continue
-        end
-
-        if os.clock() < Runtime.utilityTrafficUntil then
-            sendCredit = math.min(sendCredit, 1)
-            continue
-        end
-
-        local sendsPerSecond = State.lowEnd and 32 or 36
-        sendCredit = math.min(
-            sendCredit + math.min(tonumber(deltaTime) or 0, 0.1) * sendsPerSecond,
-            maximumBurst
-        )
-
-        local sendCount = math.min(math.floor(sendCredit), maximumBurst)
-        if sendCount <= 0 then
-            continue
-        end
-        sendCredit = sendCredit - sendCount
-
-        for _ = 1, sendCount do
-            if pressCursor > #cachedPresses then
-                pressCursor = 1
+            if State.pauseNearPress then
+                Runtime.BeginCoinPressPause(root)
+            else
+                Runtime.ReleaseCoinPressPause()
             end
 
-            local press = cachedPresses[pressCursor]
-            pressCursor = pressCursor + 1
+            local now = os.clock()
+            if now < nextSendAt then return end
+            nextSendAt = now + 0.04
+            Runtime.coinPressLastSendAt = now
 
-            Runtime.coinPressSending = true
-            pcall(function()
-                Packets.InteractStructure.send({
-                    entityID = press.entityId,
-                    itemID = goldId
-                })
-            end)
-            Runtime.coinPressSending = false
-        end
-    end
-end)
+            Packets.InteractStructure.send({
+                entityID = press.entityId,
+                itemID = goldId
+            })
+        end)
 
-task.spawn(function()
-    while Runtime.running do
-        task.wait(0.1)
-        if not State.pauseNearPress or os.clock() < Runtime.nextFreezeAt then continue end
-        local root = Runtime.GetRoot()
-        local deployables = workspace:FindFirstChild("Deployables")
-        if not root or not deployables then continue end
-        local nearPress = false
-        for _, item in ipairs(deployables:GetChildren()) do
-            if item.Name == "Coin Press" and (root.Position - item:GetPivot().Position).Magnitude <= 15 then
-                nearPress = true
-                break
-            end
-        end
-        if nearPress and not Runtime.freezeConnection then
-            Runtime.CancelMotion()
-            Runtime.StopPathMovement()
-            local lockedCFrame = root.CFrame
-            Runtime.nextFreezeAt = os.clock() + 60
-            Runtime.freezeConnection = Services.RunService.Heartbeat:Connect(function()
-                local currentCharacter = Player.Character
-                local currentRoot = currentCharacter and currentCharacter.PrimaryPart
-                if Runtime.running and State.pauseNearPress and currentRoot and currentRoot == root then
-                    currentRoot.CFrame = lockedCFrame
-                    currentRoot.AssemblyLinearVelocity = Vector3.zero
-                    currentRoot.AssemblyAngularVelocity = Vector3.zero
-                    local currentHumanoid = currentCharacter:FindFirstChildOfClass("Humanoid")
-                    if currentHumanoid then
-                        currentHumanoid.Jump = false
-                        currentHumanoid:Move(Vector3.zero, false)
-                        local state = currentHumanoid:GetState()
-                        if state == Enum.HumanoidStateType.Jumping
-                            or state == Enum.HumanoidStateType.Freefall then
-                            pcall(function()
-                                currentHumanoid:ChangeState(Enum.HumanoidStateType.Running)
-                            end)
-                        end
-                    end
-                else
-                    if Runtime.freezeConnection then
-                        Runtime.freezeConnection:Disconnect()
-                        Runtime.freezeConnection = nil
-                    end
-                end
-            end)
-            task.delay(13, function()
-                if Runtime.freezeConnection then
-                    Runtime.freezeConnection:Disconnect()
-                    Runtime.freezeConnection = nil
-                end
-            end)
+        if not completed then
+            Runtime.ReleaseCoinPressPause()
+            task.wait(0.15)
         end
     end
 end)
@@ -4527,48 +4540,43 @@ task.spawn(function()
 end)
 
 task.spawn(function()
-    local accumulator = 0
-
     while Runtime.running do
-        local _, deltaTime = Services.RunService.Stepped:Wait()
+        task.wait(0.1)
 
-        if not State.goldHitAura then
-            accumulator = 0
+        local completed = pcall(function()
+            if not State.goldHitAura then
+                Runtime.auraLastTargetCount = 0
+                return
+            end
+
+            local root = Runtime.GetRoot()
+            if not root then
+                Runtime.auraLastTargetCount = 0
+                return
+            end
+
+            local nodes = Runtime.GetResourceAuraTargets(root, 20)
+            local entityIds = {}
+
+            for index = 1, math.min(#nodes, 20) do
+                entityIds[#entityIds + 1] = nodes[index].entityId
+            end
+
+            Runtime.auraLastTargetCount = #entityIds
+
+            local auraToggle = UI.Toggles.goldHitAura
+            if auraToggle then
+                auraToggle.button.Text = "Gold Hit Aura: ON [" .. tostring(#entityIds) .. "]"
+            end
+
+            if #entityIds > 0 then
+                Runtime.SendGoldSwing(entityIds)
+            end
+        end)
+
+        if not completed then
             Runtime.auraLastTargetCount = 0
-            continue
-        end
-
-        accumulator = accumulator + math.min(tonumber(deltaTime) or 0, 0.2)
-        local interval = State.lowEnd and 0.1 or 0.08
-        if accumulator < interval then continue end
-        accumulator = accumulator % interval
-
-        local root = Runtime.GetRoot()
-        if not root then
-            Runtime.auraLastTargetCount = 0
-            continue
-        end
-
-        local scanned, nodes = pcall(Runtime.GetResourceAuraTargets, root, 20)
-        if not scanned or type(nodes) ~= "table" then
-            Runtime.auraLastTargetCount = 0
-            continue
-        end
-
-        local entityIds = {}
-        for index = 1, math.min(#nodes, 20) do
-            entityIds[#entityIds + 1] = nodes[index].entityId
-        end
-
-        Runtime.auraLastTargetCount = #entityIds
-
-        local auraToggle = UI.Toggles.goldHitAura
-        if auraToggle then
-            auraToggle.button.Text = "Gold Hit Aura: ON [" .. tostring(#entityIds) .. "]"
-        end
-
-        if #entityIds > 0 then
-            Runtime.SendGoldSwing(entityIds)
+            task.wait(0.2)
         end
     end
 end)
@@ -4722,8 +4730,6 @@ function Runtime.CountWorldCoins()
 end
 
 Runtime.coinWebhookUrl = tostring(Global.BoogaWebhook or "")
-Runtime.coinDatabaseRoot = "https://keyvalue.Immanuel.co/api/KeyVal"
-Runtime.coinDatabaseNamespace = "n9ipufne"
 Runtime.coinAccounts = {}
 Runtime.totalInstances = 10
 Runtime.usedConfiguredAccounts = false
@@ -4753,6 +4759,7 @@ if configuredAccounts and #configuredAccounts > 0 then
             Runtime.coinAccounts[normalized] = "Instance " .. tostring(instanceIndex)
         end
     end
+
     if instanceIndex > 0 then
         Runtime.totalInstances = instanceIndex
         Runtime.usedConfiguredAccounts = true
@@ -4772,15 +4779,17 @@ if not Runtime.usedConfiguredAccounts then
         "NotEwTraction",
         "LordMason68"
     }
+
     for index, username in ipairs(fallbackAccounts) do
         Runtime.coinAccounts[NormalizeBoogaAccountName(username)] = "Instance " .. tostring(index)
     end
 end
+
 Runtime.httpRequest = http_request or request or (syn and syn.request) or (http and http.request)
 Runtime.instanceId = Runtime.coinAccounts[NormalizeBoogaAccountName(Player.Name)]
-Runtime.databaseKey = Runtime.instanceId and string.gsub(Runtime.instanceId, " ", "_") or nil
-Runtime.databaseStatus = Runtime.instanceId and "DB waiting" or "Account list mismatch"
+Runtime.instanceNumber = Runtime.instanceId and tonumber(string.match(Runtime.instanceId, "%d+")) or nil
 Runtime.reportStatus = Runtime.instanceId and "Report waiting" or "Check Roblox username"
+Runtime.databaseStatus = Runtime.instanceId and "Direct" or "Account list mismatch"
 
 function Runtime.GetHttpStatus(response)
     if type(response) ~= "table" then return nil end
@@ -4802,32 +4811,147 @@ function Runtime.UpdateWebhookWatcher()
     end
 end
 
-function Runtime.ToHex(value)
-    return (string.gsub(value, ".", function(character)
-        return string.format("%02x", string.byte(character))
-    end))
-end
-
-function Runtime.FromHex(value)
-    local ok, decoded = pcall(function()
-        return (string.gsub(value, "..", function(pair)
-            return string.char(tonumber(pair, 16))
-        end))
-    end)
-    return ok and decoded or nil
-end
-
 function Runtime.FormatUptime(seconds)
     if seconds < 60 then return tostring(seconds) .. "s" end
-    if seconds < 3600 then return tostring(math.floor(seconds / 60)) .. "m " .. tostring(seconds % 60) .. "s" end
-    return tostring(math.floor(seconds / 3600)) .. "h " .. tostring(math.floor(seconds % 3600 / 60)) .. "m"
+    if seconds < 3600 then
+        return tostring(math.floor(seconds / 60)) .. "m " .. tostring(seconds % 60) .. "s"
+    end
+    return tostring(math.floor(seconds / 3600))
+        .. "h "
+        .. tostring(math.floor(seconds % 3600 / 60))
+        .. "m"
+end
+
+function Runtime.GetWebhookRetryDelay(response, attempt)
+    local status = Runtime.GetHttpStatus(response)
+    if status == 429 and type(response) == "table" and response.Body then
+        local decoded = nil
+        pcall(function()
+            decoded = Services.HttpService:JSONDecode(response.Body)
+        end)
+        local retryAfter = decoded and tonumber(decoded.retry_after)
+        if retryAfter then
+            if retryAfter > 100 then retryAfter = retryAfter / 1000 end
+            return math.clamp(retryAfter + 0.25, 0.5, 30)
+        end
+    end
+    return math.min(2 + attempt * 2, 10)
+end
+
+function Runtime.SendCoinWebhook(fields)
+    if Runtime.coinWebhookUrl == "" then
+        Runtime.reportStatus = "Webhook not configured"
+        Runtime.UpdateWebhookWatcher()
+        return false
+    end
+
+    if not Runtime.httpRequest then
+        Runtime.reportStatus = "HTTP unsupported"
+        Runtime.UpdateWebhookWatcher()
+        return false
+    end
+
+    local body = Services.HttpService:JSONEncode({
+        embeds = {{
+            title = "Booga Booga Coin Report",
+            color = 9090296,
+            fields = fields
+        }}
+    })
+
+    local url = Runtime.coinWebhookUrl
+        .. (string.find(Runtime.coinWebhookUrl, "?", 1, true) and "&wait=true" or "?wait=true")
+
+    local lastStatus = "request error"
+    for attempt = 1, 4 do
+        local called, response = pcall(function()
+            return Runtime.httpRequest({
+                Url = url,
+                Method = "POST",
+                Headers = {["Content-Type"] = "application/json"},
+                Body = body
+            })
+        end)
+
+        if called then
+            local accepted, status = Runtime.HttpSucceeded(response)
+            lastStatus = "HTTP " .. tostring(status)
+
+            if accepted then
+                Runtime.reportStatus = "Sent " .. tostring(status)
+                Runtime.UpdateWebhookWatcher()
+                return true
+            end
+
+            if attempt < 4 then
+                Runtime.reportStatus = "Retry " .. tostring(attempt) .. "/4 " .. lastStatus
+                Runtime.UpdateWebhookWatcher()
+                task.wait(Runtime.GetWebhookRetryDelay(response, attempt))
+            end
+        elseif attempt < 4 then
+            Runtime.reportStatus = "Retry " .. tostring(attempt) .. "/4 request error"
+            Runtime.UpdateWebhookWatcher()
+            task.wait(math.min(2 + attempt * 2, 10))
+        end
+    end
+
+    Runtime.reportStatus = "Failed " .. lastStatus
+    Runtime.UpdateWebhookWatcher()
+    return false
+end
+
+function Runtime.RunCoinReporterCycle()
+    if not Runtime.instanceId then return false end
+
+    local coins = Runtime.CountWorldCoins()
+    local instanceName = Runtime.instanceId
+    UI.Watcher.Workers.Text = "Workers\n1 local / "
+        .. tostring(Runtime.totalInstances)
+        .. " configured"
+    Runtime.databaseStatus = "Direct"
+
+    local fields = {
+        {
+            name = instanceName,
+            value = "Coins: "
+                .. tostring(coins)
+                .. "\nCalculated: "
+                .. tostring(coins * 5),
+            inline = true
+        },
+        {
+            name = "Status",
+            value = "Online | "
+                .. instanceName
+                .. " of "
+                .. tostring(Runtime.totalInstances),
+            inline = true
+        },
+        {
+            name = "Session",
+            value = "Uptime: "
+                .. Runtime.FormatUptime(os.time() - Runtime.startedAt),
+            inline = false
+        }
+    }
+
+    return Runtime.SendCoinWebhook(fields)
 end
 
 UI.Watcher.Instance.Text = "Instance\n" .. (Runtime.instanceId or "Account not mapped")
+
+if Runtime.instanceId then
+    UI.Watcher.Workers.Text = "Workers\n1 local / "
+        .. tostring(Runtime.totalInstances)
+        .. " configured"
+elseif not Runtime.instanceId then
+    UI.Watcher.Workers.Text = "Workers\nAccount not mapped"
+end
+
 if not Runtime.httpRequest then
-    Runtime.databaseStatus = "DB unavailable"
     Runtime.reportStatus = "HTTP unsupported"
 end
+
 Runtime.UpdateWebhookWatcher()
 
 task.spawn(function()
@@ -4840,202 +4964,25 @@ task.spawn(function()
     end
 end)
 
-if Runtime.instanceId and Runtime.httpRequest then
-    if Runtime.totalInstances > 1 then
-        task.spawn(function()
-            while Runtime.running do
-            local coins = Runtime.CountWorldCoins()
-            local payload = {
-                name = Runtime.instanceId,
-                coins = coins,
-                calculated = coins * 5,
-                timestamp = os.time()
-            }
-            local encoded = Runtime.ToHex(Services.HttpService:JSONEncode(payload))
-            local ok, response = pcall(function()
-                return Runtime.httpRequest({
-                    Url = Runtime.coinDatabaseRoot .. "/UpdateValue/" .. Runtime.coinDatabaseNamespace .. "/" .. Runtime.databaseKey .. "/" .. encoded,
-                    Method = "POST",
-                    Body = ""
-                })
-            end)
-            local accepted, status = false, "error"
-            if ok then accepted, status = Runtime.HttpSucceeded(response) end
-            Runtime.databaseStatus = accepted and ("DB " .. tostring(status)) or ("DB failed " .. tostring(status))
-                Runtime.UpdateWebhookWatcher()
-                task.wait(30)
-            end
-        end)
-    else
-        Runtime.databaseStatus = "Direct mode"
-        Runtime.UpdateWebhookWatcher()
-    end
-
-    function Runtime.SendCoinWebhook(fields)
-        if Runtime.coinWebhookUrl == "" then
-            Runtime.reportStatus = "Webhook not configured"
-            Runtime.UpdateWebhookWatcher()
-            return false
-        end
-
-        local body = Services.HttpService:JSONEncode({
-            embeds = {{
-                title = "Booga Booga Coin Report",
-                color = 9090296,
-                fields = fields
-            }}
-        })
-        local url = Runtime.coinWebhookUrl
-            .. (string.find(Runtime.coinWebhookUrl, "?", 1, true) and "&wait=true" or "?wait=true")
-        local lastStatus = "request error"
-        for attempt = 1, 3 do
-            local called, response = pcall(function()
-                return Runtime.httpRequest({
-                    Url = url,
-                    Method = "POST",
-                    Headers = {["Content-Type"] = "application/json"},
-                    Body = body
-                })
-            end)
-            if called then
-                local accepted, status = Runtime.HttpSucceeded(response)
-                lastStatus = "HTTP " .. tostring(status)
-                if accepted then
-                    Runtime.reportStatus = "Sent " .. tostring(status)
-                    Runtime.UpdateWebhookWatcher()
-                    return true
-                end
-            end
-            Runtime.reportStatus = "Retry " .. tostring(attempt) .. "/3 " .. lastStatus
-            Runtime.UpdateWebhookWatcher()
-            if attempt < 3 then task.wait(attempt * 2) end
-        end
-        Runtime.reportStatus = "Failed " .. lastStatus
-        Runtime.UpdateWebhookWatcher()
-        return false
-    end
-
-    function Runtime.RunCoinReporterCycle()
-        if Runtime.totalInstances == 1 then
-            local coins = Runtime.CountWorldCoins()
-            UI.Watcher.Workers.Text = "Workers\n1 / 1 online"
-            Runtime.databaseStatus = "Direct mode"
-            local fields = {
-                {
-                    name = "Instance 1",
-                    value = "Coins: " .. tostring(coins) .. "\nCalculated: " .. tostring(coins * 5),
-                    inline = true
-                },
-                {
-                    name = "System Status",
-                    value = "No crashes - farming normal.",
-                    inline = true
-                },
-                {
-                    name = "Combined Totals",
-                    value = "Coins: " .. tostring(coins)
-                        .. " | Calculated: " .. tostring(coins * 5)
-                        .. " | Workers: 1 / 1"
-                        .. " | Uptime: " .. Runtime.FormatUptime(os.time() - Runtime.startedAt),
-                    inline = false
-                }
-            }
-            return Runtime.SendCoinWebhook(fields)
-        end
-
-        local fetched, activeCount, now = {}, 0, os.time()
-        for index = 1, Runtime.totalInstances do
-            local key = "Instance_" .. tostring(index)
-            pcall(function()
-                local response = Runtime.httpRequest({
-                    Url = Runtime.coinDatabaseRoot .. "/GetValue/" .. Runtime.coinDatabaseNamespace .. "/" .. key,
-                    Method = "GET"
-                })
-                local accepted = Runtime.HttpSucceeded(response)
-                if accepted and response.Body and response.Body ~= "" and response.Body ~= "null" then
-                    local body = response.Body
-                    if string.sub(body, 1, 1) == "\"" and string.sub(body, -1) == "\"" then
-                        body = string.sub(body, 2, -2)
-                    end
-                    local json = Runtime.FromHex(body)
-                    if json then
-                        local decoded, info = pcall(function() return Services.HttpService:JSONDecode(json) end)
-                        if decoded and info and info.timestamp and math.abs(now - info.timestamp) < 300 then
-                            fetched[key] = info
-                            activeCount = activeCount + 1
-                        end
-                    end
-                end
-            end)
-        end
-
-        UI.Watcher.Workers.Text = "Workers\n" .. tostring(activeCount) .. " / " .. tostring(Runtime.totalInstances) .. " online"
-        local reporter = nil
-        for index = 1, Runtime.totalInstances do
-            local key = "Instance_" .. tostring(index)
-            if fetched[key] then reporter = key break end
-        end
-
-        if reporter ~= Runtime.databaseKey then
-            Runtime.reportStatus = reporter and ("Reporter " .. string.gsub(reporter, "_", " ")) or "No active workers"
-            Runtime.UpdateWebhookWatcher()
-            return reporter ~= nil
-        end
-
-        local totalCoins, totalCalculated, fields, missing = 0, 0, {}, false
-        for index = 1, Runtime.totalInstances do
-            local info = fetched["Instance_" .. tostring(index)]
-            if info then
-                totalCoins = totalCoins + (tonumber(info.coins) or 0)
-                totalCalculated = totalCalculated + (tonumber(info.calculated) or 0)
-                table.insert(fields, {
-                    name = "Instance " .. tostring(index),
-                    value = "Coins: " .. tostring(info.coins) .. "\nCalculated: " .. tostring(info.calculated),
-                    inline = true
-                })
-            else
-                missing = true
-                table.insert(fields, {
-                    name = "Instance " .. tostring(index),
-                    value = "Not detected / crashed",
-                    inline = true
-                })
-            end
-        end
-        table.insert(fields, {
-            name = "System Status",
-            value = missing and "Crashes found - check status." or "No crashes - farming normal.",
-            inline = true
-        })
-        table.insert(fields, {
-            name = "Combined Totals",
-            value = "Coins: " .. tostring(totalCoins)
-                .. " | Calculated: " .. tostring(totalCalculated)
-                .. " | Workers: " .. tostring(activeCount) .. " / " .. tostring(Runtime.totalInstances)
-                .. " | Uptime: " .. Runtime.FormatUptime(os.time() - Runtime.startedAt),
-            inline = false
-        })
-        return Runtime.SendCoinWebhook(fields)
-    end
-
+if Runtime.instanceId then
     task.spawn(function()
-        task.wait(5)
+        local stagger = 5 + math.max((Runtime.instanceNumber or 1) - 1, 0) * 1.5
+        task.wait(stagger)
+
         while Runtime.running do
             local ran, completed = pcall(Runtime.RunCoinReporterCycle)
             if not ran then
                 Runtime.reportStatus = "Reporter cycle error"
                 Runtime.UpdateWebhookWatcher()
             end
+
             local delay = ran and completed and 660 or 30
             local deadline = os.clock() + delay
-            while Runtime.running and os.clock() < deadline do task.wait(1) end
+            while Runtime.running and os.clock() < deadline do
+                task.wait(1)
+            end
         end
     end)
-elseif not Runtime.instanceId then
-    UI.Watcher.Workers.Text = "Workers\nAccount not mapped"
-    Runtime.databaseStatus = "Account list mismatch"
-    Runtime.reportStatus = "Check Roblox username"
-    Runtime.UpdateWebhookWatcher()
 end
 
 local function DestroyBoogaUi()
