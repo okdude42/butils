@@ -138,7 +138,8 @@ local Runtime = {
     harvestCursor = {
         Sunfruit = 1,
         Bloodfruit = 1
-    }
+    },
+    goldAuraRegistry = setmetatable({}, {__mode = "k"})
 }
 Runtime.pathSpeed = 19
 Runtime.pathHoverOffset = 0.1
@@ -3751,50 +3752,69 @@ function Runtime.ReleaseGoldPart(part)
     end)
 end
 
+function Runtime.IsGoldAuraNode(object)
+    if not object or not object:IsA("Model") then return false end
+    return string.find(Runtime.Normalized(object.Name), "gold", 1, true) ~= nil
+end
+
+function Runtime.RegisterGoldAuraNode(object)
+    local model = object and (object:IsA("Model") and object or object:FindFirstAncestorOfClass("Model"))
+    if model and Runtime.IsGoldAuraNode(model) then
+        Runtime.goldAuraRegistry[model] = true
+    end
+end
+
+function Runtime.UnregisterGoldAuraNode(object)
+    local model = object and (object:IsA("Model") and object or object:FindFirstAncestorOfClass("Model"))
+    if model then
+        Runtime.goldAuraRegistry[model] = nil
+    end
+end
+
 function Runtime.GetResourceAuraTargets(root, range)
-    local results, seenModels, seenIds = {}, {}, {}
-    local resources = workspace:FindFirstChild("Resources")
+    local results, seenIds = {}, {}
 
-    local function inspect(resource)
-        if not resource or seenModels[resource] or not resource:IsA("Model") then return end
-        seenModels[resource] = true
+    for resource in pairs(Runtime.goldAuraRegistry) do
+        if not resource or not resource.Parent then
+            Runtime.goldAuraRegistry[resource] = nil
+        else
+            local entityId = tonumber(Runtime.GetEntityId(resource))
+            local part = resource.PrimaryPart or resource:FindFirstChildWhichIsA("BasePart", true)
 
-        local entityId = tonumber(Runtime.GetEntityId(resource))
-        if not entityId or seenIds[entityId] then return end
+            if entityId and part then
+                entityId = math.floor(entityId)
+                local distance = (part.Position - root.Position).Magnitude
 
-        local part = resource.PrimaryPart or resource:FindFirstChildWhichIsA("BasePart")
-        if not part then return end
-
-        local distance = (part.Position - root.Position).Magnitude
-        if distance > range then return end
-
-        seenIds[entityId] = true
-        table.insert(results, {
-            entityId = entityId,
-            distance = distance,
-            isGold = string.find(Runtime.Normalized(resource.Name), "gold", 1, true) ~= nil
-        })
-    end
-
-    if resources then
-        for _, resource in ipairs(resources:GetChildren()) do
-            inspect(resource)
-        end
-    end
-
-    for _, resource in ipairs(workspace:GetChildren()) do
-        if resource:IsA("Model") and resource.Name == "Gold Node" then
-            inspect(resource)
+                if distance <= range and not seenIds[entityId] then
+                    seenIds[entityId] = true
+                    results[#results + 1] = {
+                        model = resource,
+                        entityId = entityId,
+                        distance = distance
+                    }
+                end
+            end
         end
     end
 
     table.sort(results, function(a, b)
-        if a.isGold ~= b.isGold then return a.isGold end
         return a.distance < b.distance
     end)
 
     return results
 end
+
+for _, descendant in ipairs(workspace:GetDescendants()) do
+    Runtime.RegisterGoldAuraNode(descendant)
+end
+
+table.insert(Runtime.connections, workspace.DescendantAdded:Connect(function(object)
+    Runtime.RegisterGoldAuraNode(object)
+end))
+
+table.insert(Runtime.connections, workspace.DescendantRemoving:Connect(function(object)
+    Runtime.UnregisterGoldAuraNode(object)
+end))
 
 function Runtime.UpdatePath()
     if not State.startPath or Runtime.freezeConnection or Runtime.coinTweenActive then return end
@@ -4672,7 +4692,7 @@ end)
 
 task.spawn(function()
     while Runtime.running do
-        task.wait(0.1)
+        task.wait(0.08)
 
         local completed = pcall(function()
             if not State.goldHitAura then
@@ -4687,21 +4707,16 @@ task.spawn(function()
             end
 
             local nodes = Runtime.GetResourceAuraTargets(root, 20)
-            local entityIds = {}
-
-            for index = 1, math.min(#nodes, 20) do
-                entityIds[#entityIds + 1] = nodes[index].entityId
-            end
-
-            Runtime.auraLastTargetCount = #entityIds
+            Runtime.auraLastTargetCount = #nodes
 
             local auraToggle = UI.Toggles.goldHitAura
             if auraToggle then
-                auraToggle.button.Text = "Gold Hit Aura: ON [" .. tostring(#entityIds) .. "]"
+                auraToggle.button.Text = "Gold Hit Aura: ON [" .. tostring(#nodes) .. "]"
             end
 
-            if #entityIds > 0 then
-                Runtime.SendGoldSwing(entityIds)
+            local nearest = nodes[1]
+            if nearest then
+                Runtime.SendGoldSwing({nearest.entityId})
             end
         end)
 
