@@ -4669,8 +4669,9 @@ task.spawn(function()
 end)
 
 if Runtime.instanceId and Runtime.httpRequest then
-    task.spawn(function()
-        while Runtime.running do
+    if Runtime.totalInstances > 1 then
+        task.spawn(function()
+            while Runtime.running do
             local coins = Runtime.CountWorldCoins()
             local payload = {
                 name = Runtime.instanceId,
@@ -4689,10 +4690,14 @@ if Runtime.instanceId and Runtime.httpRequest then
             local accepted, status = false, "error"
             if ok then accepted, status = Runtime.HttpSucceeded(response) end
             Runtime.databaseStatus = accepted and ("DB " .. tostring(status)) or ("DB failed " .. tostring(status))
-            Runtime.UpdateWebhookWatcher()
-            task.wait(30)
-        end
-    end)
+                Runtime.UpdateWebhookWatcher()
+                task.wait(30)
+            end
+        end)
+    else
+        Runtime.databaseStatus = "Direct mode"
+        Runtime.UpdateWebhookWatcher()
+    end
 
     function Runtime.SendCoinWebhook(fields)
         if Runtime.coinWebhookUrl == "" then
@@ -4739,6 +4744,33 @@ if Runtime.instanceId and Runtime.httpRequest then
     end
 
     function Runtime.RunCoinReporterCycle()
+        if Runtime.totalInstances == 1 then
+            local coins = Runtime.CountWorldCoins()
+            UI.Watcher.Workers.Text = "Workers\n1 / 1 online"
+            Runtime.databaseStatus = "Direct mode"
+            local fields = {
+                {
+                    name = "Instance 1",
+                    value = "Coins: " .. tostring(coins) .. "\nCalculated: " .. tostring(coins * 5),
+                    inline = true
+                },
+                {
+                    name = "System Status",
+                    value = "No crashes - farming normal.",
+                    inline = true
+                },
+                {
+                    name = "Combined Totals",
+                    value = "Coins: " .. tostring(coins)
+                        .. " | Calculated: " .. tostring(coins * 5)
+                        .. " | Workers: 1 / 1"
+                        .. " | Uptime: " .. Runtime.FormatUptime(os.time() - Runtime.startedAt),
+                    inline = false
+                }
+            }
+            return Runtime.SendCoinWebhook(fields)
+        end
+
         local fetched, activeCount, now = {}, 0, os.time()
         for index = 1, Runtime.totalInstances do
             local key = "Instance_" .. tostring(index)
