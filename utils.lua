@@ -129,7 +129,16 @@ local Runtime = {
     coinPressPaused = false,
     coinPressGoldCount = 0,
     coinPressLastSendAt = 0,
-    harvestLastSuccessAt = 0
+    harvestLastSuccessAt = 0,
+    harvestRegistry = {
+        Sunfruit = setmetatable({}, {__mode = "k"}),
+        Bloodfruit = setmetatable({}, {__mode = "k"})
+    },
+    harvestLastSentAt = {},
+    harvestCursor = {
+        Sunfruit = 1,
+        Bloodfruit = 1
+    }
 }
 Runtime.pathSpeed = 19
 Runtime.pathHoverOffset = 0.1
@@ -3398,56 +3407,115 @@ function Runtime.GetPlantBoxes(root, range)
     return results
 end
 
+function Runtime.GetHarvestFruitName(object)
+    if not object then return nil end
+
+    local current = object
+    while current and current ~= workspace do
+        local normalizedName = Runtime.Normalized(current.Name)
+        if string.find(normalizedName, "sunfruit", 1, true) then
+            return "Sunfruit"
+        end
+        if string.find(normalizedName, "bloodfruit", 1, true) then
+            return "Bloodfruit"
+        end
+        current = current.Parent
+    end
+
+    return nil
+end
+
+function Runtime.RegisterHarvestCandidate(object)
+    if not object then return end
+
+    local model = object:IsA("Model") and object or object:FindFirstAncestorOfClass("Model")
+    if not model then return end
+
+    local fruitName = Runtime.GetHarvestFruitName(model)
+    if fruitName and Runtime.harvestRegistry[fruitName] then
+        Runtime.harvestRegistry[fruitName][model] = true
+    end
+end
+
+function Runtime.UnregisterHarvestCandidate(object)
+    if not object then return end
+
+    local model = object:IsA("Model") and object or object:FindFirstAncestorOfClass("Model")
+    if not model then return end
+
+    for _, registry in pairs(Runtime.harvestRegistry) do
+        registry[model] = nil
+    end
+end
+
+function Runtime.GetHarvestEntityId(model)
+    if not model then return nil end
+
+    local entityId = tonumber(model:GetAttribute("EntityID"))
+    if entityId then return math.floor(entityId) end
+
+    local primaryPart = model.PrimaryPart
+    entityId = primaryPart and tonumber(primaryPart:GetAttribute("EntityID"))
+    if entityId then return math.floor(entityId) end
+
+    for _, descendant in ipairs(model:GetDescendants()) do
+        entityId = tonumber(descendant:GetAttribute("EntityID"))
+        if entityId then
+            return math.floor(entityId)
+        end
+    end
+
+    return nil
+end
+
+function Runtime.GetHarvestPart(model)
+    if not model then return nil end
+
+    local part = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart", true)
+    if part then return part end
+
+    local ok, pivot = pcall(function()
+        return model:GetPivot()
+    end)
+    if ok and pivot then
+        return {
+            Position = pivot.Position
+        }
+    end
+
+    return nil
+end
+
 function Runtime.GetBushes(root, range, fruitFilter)
-    local results, seenModels, seenIds = {}, {}, {}
     local selectedFruit = type(fruitFilter) == "string" and fruitFilter
         or (fruitFilter == true and "Sunfruit" or nil)
-    local selectedNormalized = selectedFruit and Runtime.Normalized(selectedFruit) or nil
+    if not selectedFruit or not Runtime.harvestRegistry[selectedFruit] then
+        return {}
+    end
 
-    local function inspect(model)
-        if not model or seenModels[model] or not model:IsA("Model") then return end
-        seenModels[model] = true
+    local results = {}
+    local seenIds = {}
+    local registry = Runtime.harvestRegistry[selectedFruit]
 
-        local normalizedName = Runtime.Normalized(model.Name)
-        local matched = selectedNormalized
-            and string.find(normalizedName, selectedNormalized, 1, true) ~= nil
-            or false
+    for model in pairs(registry) do
+        if not model or not model.Parent then
+            registry[model] = nil
+        else
+            local part = Runtime.GetHarvestPart(model)
+            local entityId = Runtime.GetHarvestEntityId(model)
 
-        if not selectedNormalized then
-            for fruitName in pairs(FruitIDs) do
-                if string.find(normalizedName, Runtime.Normalized(fruitName), 1, true) then
-                    matched = true
-                    break
+            if part and entityId and not seenIds[entityId] then
+                local distance = (part.Position - root.Position).Magnitude
+                if distance <= range then
+                    seenIds[entityId] = true
+                    results[#results + 1] = {
+                        model = model,
+                        part = part,
+                        entityId = entityId,
+                        distance = distance
+                    }
                 end
             end
-        end
-
-        if not matched then return end
-
-        local part = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
-        local entityId = tonumber(Runtime.GetEntityId(model))
-        if not part or not entityId or seenIds[entityId] then return end
-
-        local distance = (part.Position - root.Position).Magnitude
-        if distance > range then return end
-
-        seenIds[entityId] = true
-        table.insert(results, {
-            model = model,
-            part = part,
-            entityId = entityId,
-            distance = distance
-        })
-    end
-
-    for _, model in ipairs(workspace:GetChildren()) do
-        inspect(model)
-    end
-
-    local resources = workspace:FindFirstChild("Resources")
-    if resources then
-        for _, model in ipairs(resources:GetChildren()) do
-            inspect(model)
         end
     end
 
@@ -3457,6 +3525,57 @@ function Runtime.GetBushes(root, range, fruitFilter)
 
     return results
 end
+
+function Runtime.SendHarvestPickup(entityId)
+    entityId = tonumber(entityId)
+    if not entityId then return false end
+    entityId = math.floor(entityId)
+
+    local now = os.clock()
+    local previous = Runtime.harvestLastSentAt[entityId] or 0
+    if now - previous < 0.14 then
+        return false
+    end
+    Runtime.harvestLastSentAt[entityId] = now
+
+    local directSent = false
+    if Packets and Packets.Pickup and type(Packets.Pickup.send) == "function" then
+        directSent = pcall(function()
+            Packets.Pickup.send(entityId)
+        end)
+    end
+
+    local rawSent = false
+    if ByteNetReliable
+        and type(buffer) == "table"
+        and type(buffer.fromstring) == "function"
+        and entityId >= 0
+        and entityId <= 16777215 then
+        rawSent = pcall(function()
+            local packet = string.pack("<BBI3x", 0x01, 0xE7, entityId)
+            ByteNetReliable:FireServer(buffer.fromstring(packet))
+        end)
+    end
+
+    if directSent or rawSent then
+        Runtime.harvestLastSuccessAt = now
+        return true
+    end
+
+    return false
+end
+
+for _, descendant in ipairs(workspace:GetDescendants()) do
+    Runtime.RegisterHarvestCandidate(descendant)
+end
+
+table.insert(Runtime.connections, workspace.DescendantAdded:Connect(function(object)
+    Runtime.RegisterHarvestCandidate(object)
+end))
+
+table.insert(Runtime.connections, workspace.DescendantRemoving:Connect(function(object)
+    Runtime.UnregisterHarvestCandidate(object)
+end))
 
 function Runtime.EncodeFloat16(value)
     value = tonumber(value) or 0
@@ -3841,24 +3960,30 @@ end)
 
 task.spawn(function()
     while Runtime.running do
-        task.wait(0.1)
+        task.wait(0.08)
 
         local completed = pcall(function()
-            if not State.autoFarm or not Packets or not Packets.Pickup or not Packets.Pickup.send then
-                return
-            end
+            if not State.autoFarm then return end
 
             local root = Runtime.GetRoot()
             if not root then return end
 
-            for _, bush in ipairs(Runtime.GetBushes(root, 45, "Sunfruit")) do
-                local sent = pcall(function()
-                    Packets.Pickup.send(bush.entityId)
-                end)
-                if sent then
-                    Runtime.harvestLastSuccessAt = os.clock()
-                end
+            local bushes = Runtime.GetBushes(root, 45, "Sunfruit")
+            if #bushes == 0 then
+                Runtime.harvestCursor.Sunfruit = 1
+                return
             end
+
+            local cursor = Runtime.harvestCursor.Sunfruit
+            local sendCount = math.min(#bushes, 12)
+
+            for _ = 1, sendCount do
+                if cursor > #bushes then cursor = 1 end
+                Runtime.SendHarvestPickup(bushes[cursor].entityId)
+                cursor = cursor + 1
+            end
+
+            Runtime.harvestCursor.Sunfruit = cursor
         end)
 
         if not completed then
@@ -3935,24 +4060,30 @@ end)
 
 task.spawn(function()
     while Runtime.running do
-        task.wait(0.1)
+        task.wait(0.08)
 
         local completed = pcall(function()
-            if not State.bfAutoHarvest or not Packets or not Packets.Pickup or not Packets.Pickup.send then
-                return
-            end
+            if not State.bfAutoHarvest then return end
 
             local root = Runtime.GetRoot()
             if not root then return end
 
-            for _, bush in ipairs(Runtime.GetBushes(root, 30, "Bloodfruit")) do
-                local sent = pcall(function()
-                    Packets.Pickup.send(bush.entityId)
-                end)
-                if sent then
-                    Runtime.harvestLastSuccessAt = os.clock()
-                end
+            local bushes = Runtime.GetBushes(root, 30, "Bloodfruit")
+            if #bushes == 0 then
+                Runtime.harvestCursor.Bloodfruit = 1
+                return
             end
+
+            local cursor = Runtime.harvestCursor.Bloodfruit
+            local sendCount = math.min(#bushes, 12)
+
+            for _ = 1, sendCount do
+                if cursor > #bushes then cursor = 1 end
+                Runtime.SendHarvestPickup(bushes[cursor].entityId)
+                cursor = cursor + 1
+            end
+
+            Runtime.harvestCursor.Bloodfruit = cursor
         end)
 
         if not completed then
